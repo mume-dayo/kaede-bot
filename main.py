@@ -1,3 +1,4 @@
+
 import discord
 from discord.ext import commands
 from discord import app_commands, ui
@@ -6,7 +7,6 @@ import random
 import os
 import asyncio
 from aiohttp import web
-import threading
 
 # --- DBセットアップ ---
 conn = sqlite3.connect("achievement_settings.db")
@@ -47,7 +47,6 @@ class CategorySelect(ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected = self.values[0]
         await interaction.response.send_message(f"✅ カテゴリー「{selected}」でチケットを作成します（仮処理）", ephemeral=True)
-        # チケット作成処理はここに実装可
 
 # --- ロール付与ボタンビュー ---
 class RoleButtonView(ui.View):
@@ -69,10 +68,24 @@ class RoleButtonView(ui.View):
         except Exception as e:
             await interaction.response.send_message(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
 
+# --- Webサーバー（Render用） ---
+async def health_check(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    port = int(os.environ.get('PORT', 5000))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
 # --- コマンド群 ---
 
 # 実績投稿チャンネル設定（管理者限定）
-@bot.tree.command(name="achievement_channel_set", description="実績投稿チャンネルを設定（管理者限定）")
+@bot.tree.command(name="achievement_channel", description="実績投稿チャンネルを設定")
 @app_commands.describe(channel="実績投稿チャンネルに設定するテキストチャンネル")
 @app_commands.checks.has_permissions(administrator=True)
 async def achievement_channel_set(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -125,7 +138,7 @@ async def write_achievement(interaction: discord.Interaction,
         await interaction.response.send_message("⚠️ 実績投稿チャンネルへの送信権限がありません。", ephemeral=True)
 
 # カテゴリー作成コマンド（管理者限定）
-@bot.tree.command(name="category_create", description="カテゴリーを作成します（管理者限定）")
+@bot.tree.command(name="category_create", description="カテゴリーを作成します")
 @app_commands.describe(name="カテゴリー名", emoji="カテゴリーの絵文字（任意）")
 @app_commands.checks.has_permissions(administrator=True)
 async def category_create(interaction: discord.Interaction, name: str, emoji: str = None):
@@ -139,7 +152,7 @@ async def category_create(interaction: discord.Interaction, name: str, emoji: st
     await interaction.response.send_message(f"✅ カテゴリー「{name}」を作成しました。", ephemeral=True)
 
 # カテゴリー削除コマンド（管理者限定・選択型）
-@bot.tree.command(name="category_delete", description="カテゴリーを削除します（管理者限定）")
+@bot.tree.command(name="category_delete", description="カテゴリーを削除します")
 @app_commands.checks.has_permissions(administrator=True)
 async def category_delete(interaction: discord.Interaction):
     guild_id = interaction.guild.id
@@ -171,7 +184,7 @@ async def category_delete(interaction: discord.Interaction):
     await interaction.response.send_message("🗑️ 削除するカテゴリーを選択してください。", view=view, ephemeral=True)
 
 # チケットパネル作成コマンド
-@bot.tree.command(name="ticket_panel", description="チケットパネルを作成します")
+@bot.tree.command(name="maketike_panel", description="チケットパネルを作るゾ")
 @app_commands.describe(title="パネルのタイトル", description="パネルの説明")
 async def ticket_panel(interaction: discord.Interaction, title: str, description: str):
     guild_id = interaction.guild.id
@@ -180,18 +193,15 @@ async def ticket_panel(interaction: discord.Interaction, title: str, description
         return
 
     embed = discord.Embed(title=title, description=description)
-
     cats = [ {"name": v["name"], "emoji": v["emoji"]} for v in categories[guild_id].values() ]
-
     await interaction.response.send_message(embed=embed, view=TicketView(cats))
 
-# 埋め込みメッセージ送信コマンド（複数絵文字対応）
-@bot.tree.command(name="send_embed", description="埋め込みメッセージを送信します（複数絵文字対応）")
+# 埋め込みメッセージ送信コマンド
+@bot.tree.command(name="send_embed", description="埋め込みめっせを送れるゾ")
 @app_commands.describe(
     title="タイトル",
     description="説明文",
-    emojis="表示したい絵文字をカンマ区切りで入力（任意）"
-)
+    emojis="表示したい絵文字をカンマ区切りで入力（任意）")
 async def send_embed(interaction: discord.Interaction, title: str, description: str, emojis: str = None):
     emoji_text = ""
     if emojis:
@@ -201,8 +211,8 @@ async def send_embed(interaction: discord.Interaction, title: str, description: 
     embed = discord.Embed(title=f"{emoji_text} {title}".strip(), description=description)
     await interaction.response.send_message(embed=embed)
 
-# ロール付与パネル作成コマンド（1コマンドでタイトル、説明、ロールID指定、絵文字付き）
-@bot.tree.command(name="role_panel", description="埋め込みパネルでボタンを押すとロール付与します")
+# ロール付与パネル作成コマンド
+@bot.tree.command(name="verify_panel", description="埋め込み型で認証パネル作るゾ")
 @app_commands.describe(
     title="パネルのタイトル",
     description="パネルの説明",
@@ -215,19 +225,19 @@ async def role_panel(interaction: discord.Interaction, title: str, description: 
     view = RoleButtonView(role)
     await interaction.response.send_message(embed=embed, view=view)
 
-# --- Webサーバー（Render用） ---
-async def health_check(request):
-    return web.Response(text="Bot is running!")
+# ランダムで10個のユーザーIDを取得するコマンド（コピー可能なコードブロック表示）
+@bot.tree.command(name="random_gift", description="必ず入ってるギフトリンクを受け取れるゾ🎁")
+async def random_users(interaction: discord.Interaction):
+    members = [member for member in interaction.guild.members if not member.bot]
+    if not members:
+        await interaction.response.send_message("⚠️ メンバーが見つかりません。", ephemeral=True)
+        return
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    port = int(os.environ.get('PORT', 5000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
+    random.shuffle(members)
+    selected = members[:10]
+    user_ids = "\n".join([f"`{member.id}`" for member in selected])
+
+    await interaction.response.send_message(f"🎲 ランダムなユーザーID:\n{user_ids}", ephemeral=True)
 
 # --- Bot起動 ---
 @bot.event
