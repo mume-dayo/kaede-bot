@@ -1,54 +1,153 @@
 
+# --- ライブラリ ---
 import discord
 from discord.ext import commands
 from discord import app_commands, ui
-import sqlite3
+from flask import Flask
+import json
+import threading
 import random
 import os
-import asyncio
-from aiohttp import web
 
-# --- DBセットアップ ---
-conn = sqlite3.connect("achievement_settings.db")
-c = conn.cursor()
-c.execute("""
-CREATE TABLE IF NOT EXISTS achievement_channels (
-    guild_id INTEGER PRIMARY KEY,
-    channel_id INTEGER
-)
-""")
-conn.commit()
+# --- データファイルパス ---
+ACHIEVEMENT_CHANNELS_FILE = "achievement_channels.json"
+CATEGORIES_FILE = "categories.json"
+
+# --- データ管理関数 ---
+def load_json_file(filename, default=None):
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default or {}
+
+def save_json_file(filename, data):
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def save_achievement_channel(guild_id, channel_id):
+    data = load_json_file(ACHIEVEMENT_CHANNELS_FILE, {})
+    data[str(guild_id)] = channel_id
+    save_json_file(ACHIEVEMENT_CHANNELS_FILE, data)
+
+def get_achievement_channel(guild_id):
+    data = load_json_file(ACHIEVEMENT_CHANNELS_FILE, {})
+    return data.get(str(guild_id))
+
+def save_category(guild_id, name, emoji):
+    data = load_json_file(CATEGORIES_FILE, {})
+    guild_key = str(guild_id)
+    if guild_key not in data:
+        data[guild_key] = []
+    
+    # 既存のカテゴリーを更新または新規追加
+    for i, cat in enumerate(data[guild_key]):
+        if cat["name"] == name:
+            data[guild_key][i] = {"name": name, "emoji": emoji}
+            break
+    else:
+        data[guild_key].append({"name": name, "emoji": emoji})
+    
+    save_json_file(CATEGORIES_FILE, data)
+
+def delete_category_db(guild_id, name):
+    data = load_json_file(CATEGORIES_FILE, {})
+    guild_key = str(guild_id)
+    if guild_key in data:
+        data[guild_key] = [cat for cat in data[guild_key] if cat["name"] != name]
+        save_json_file(CATEGORIES_FILE, data)
+
+def load_categories(guild_id):
+    data = load_json_file(CATEGORIES_FILE, {})
+    # レガシー形式（配列）の場合は新形式に変換
+    if isinstance(data, list):
+        # 配列形式のデータを新形式に変換して保存
+        new_data = {str(guild_id): data}
+        save_json_file(CATEGORIES_FILE, new_data)
+        return data
+    return data.get(str(guild_id), [])
+
+# --- Flask アプリケーション設定 ---
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Discord Bot is running!"
+
+@app.route('/status')
+def status():
+    return {"status": "online", "bot": str(bot.user) if bot.user else "offline"}
 
 # --- Bot初期化 ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- カテゴリー管理メモリ ---
-categories = {}  # {guild_id: {category_id: {"name":..., "emoji":...}}}
-
-# --- UIクラス（チケットビュー） ---
-class TicketView(ui.View):
-    def __init__(self, categories_data):
-        super().__init__(timeout=None)
-        options = []
-        for cat in categories_data:
-            label = cat["name"]
-            emoji = cat["emoji"]
-            options.append(discord.SelectOption(label=label, emoji=emoji))
-        self.add_item(CategorySelect(options))
-
+# --- チケット UI ---
 class CategorySelect(ui.Select):
     def __init__(self, options):
         super().__init__(placeholder="カテゴリーを選択してください", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         selected = self.values[0]
-        await interaction.response.send_message(f"✅ カテゴリー「{selected}」でチケットを作成します（仮処理）", ephemeral=True)
+        guild = interaction.guild
+        user = interaction.user
 
-# --- ロール付与ボタンビュー ---
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            user: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True),
+        }
+
+        for role in guild.roles:
+            if role.permissions.administrator:
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+        channel_name = f"ticket-{user.name}-{random.randint(1000, 9999)}"
+        ticket_ch = await guild.create_text_channel(channel_name, overwrites=overwrites)
+
+        await ticket_ch.send(
+            f"✅ {user.mention} さんのチケットです。カテゴリー: **{selected}**",
+            view=DeleteTicketView()
+        )
+        await interaction.response.send_message(f"✅ カテゴリー「{selected}」でチケットを作成しました！", ephemeral=True)
+
+class TicketView(ui.View):
+    def __init__(self, categories_data):
+        super().__init__(timeout=None)
+        options = [discord.SelectOption(label=cat["name"], emoji=cat["emoji"]) for cat in categories_data]
+        self.add_item(CategorySelect(options))
+
+class DeleteTicketView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="🗑️ チケットを削除", style=discord.ButtonStyle.danger)
+    async def delete_ticket(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.channel.delete()
+        await interaction.response.send_message("✅ チケットを削除しました。", ephemeral=True)
+
+# --- カテゴリー削除 UI ---
+class DeleteCategorySelect(ui.Select):
+    def __init__(self, options, guild_id):
+        super().__init__(placeholder="削除するカテゴリーを選択", min_values=1, max_values=1, options=options)
+        self.guild_id = guild_id
+
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        delete_category_db(self.guild_id, selected)
+        await interaction.response.send_message(f"✅ カテゴリー **{selected}** を削除しました。", ephemeral=True)
+
+class DeleteCategoryView(ui.View):
+    def __init__(self, categories_data, guild_id):
+        super().__init__(timeout=60)
+        options = [discord.SelectOption(label=cat["name"], emoji=cat["emoji"]) for cat in categories_data]
+        self.add_item(DeleteCategorySelect(options, guild_id))
+
+# --- ロールボタン UI ---
 class RoleButtonView(ui.View):
     def __init__(self, role: discord.Role):
         super().__init__(timeout=None)
@@ -58,210 +157,153 @@ class RoleButtonView(ui.View):
     async def role_button(self, interaction: discord.Interaction, button: ui.Button):
         member = interaction.user
         if self.role in member.roles:
-            await interaction.response.send_message(f"あなたはすでに「{self.role.name}」のロールを持っています。", ephemeral=True)
-            return
-        try:
-            await member.add_roles(self.role)
-            await interaction.response.send_message(f"✅ 「{self.role.name}」のロールを付与しました！", ephemeral=True)
-        except discord.Forbidden:
-            await interaction.response.send_message("⚠️ ロールを付与する権限がありません。", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"⚠️ エラーが発生しました: {e}", ephemeral=True)
+            await interaction.response.send_message(f"すでに「{self.role.name}」ロールを持っています。", ephemeral=True)
+        else:
+            try:
+                await member.add_roles(self.role)
+                await interaction.response.send_message(f"✅ 「{self.role.name}」を付与しました！", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"⚠️ エラー: {e}", ephemeral=True)
 
-# --- Webサーバー（Render用） ---
-async def health_check(request):
-    return web.Response(text="Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    port = int(os.environ.get('PORT', 5000))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    print(f"Web server started on port {port}")
-
-# --- コマンド群 ---
-
-# 実績投稿チャンネル設定（管理者限定）
+# --- スラッシュコマンド定義 ---
 @bot.tree.command(name="achievement_channel", description="実績投稿チャンネルを設定")
-@app_commands.describe(channel="実績投稿チャンネルに設定するテキストチャンネル")
 @app_commands.checks.has_permissions(administrator=True)
-async def achievement_channel_set(interaction: discord.Interaction, channel: discord.TextChannel):
-    guild_id = interaction.guild.id
-    c.execute("""
-    INSERT INTO achievement_channels (guild_id, channel_id)
-    VALUES (?, ?)
-    ON CONFLICT(guild_id) DO UPDATE SET channel_id=excluded.channel_id
-    """, (guild_id, channel.id))
-    conn.commit()
-    await interaction.response.send_message(f"✅ 実績投稿チャンネルを {channel.mention} に設定しました。", ephemeral=True)
+async def achievement_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    try:
+        save_achievement_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ 実績投稿チャンネルを {channel.mention} に設定しました。", ephemeral=True)
+    except Exception as e:
+        print(f"エラー: {e}")
+        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
 
-# 実績投稿コマンド
 @bot.tree.command(name="write_achievement", description="実績を投稿します")
 @app_commands.describe(
-    user_id="実績記入者のユーザーID（数字）",
+    user_id="記録者のユーザーID（数字）",
     achievement="実績内容",
     comment="コメント",
     rating="評価（1〜5）"
 )
-async def write_achievement(interaction: discord.Interaction,
-                            user_id: str,
-                            achievement: str,
-                            comment: str,
-                            rating: app_commands.Range[int, 1, 5]):
+async def write_achievement(interaction: discord.Interaction, user_id: str, achievement: str, comment: str, rating: app_commands.Range[int, 1, 5]):
     if not user_id.isdigit():
-        await interaction.response.send_message("⚠️ ユーザーIDは数字で入力してください。", ephemeral=True)
-        return
-
-    c.execute("SELECT channel_id FROM achievement_channels WHERE guild_id = ?", (interaction.guild.id,))
-    row = c.fetchone()
-    if not row:
-        await interaction.response.send_message("⚠️ 実績投稿チャンネルが設定されていません。", ephemeral=True)
-        return
-    channel = interaction.guild.get_channel(row[0])
-    if not channel:
-        await interaction.response.send_message("⚠️ 実績投稿チャンネルが見つかりません。", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="🎉 新しい実績が届きました！", color=discord.Color.gold())
-    embed.add_field(name="記入者（ユーザーID）", value=user_id, inline=False)
-    embed.add_field(name="実績内容", value=achievement, inline=False)
-    embed.add_field(name="コメント", value=comment, inline=False)
-    embed.add_field(name="評価", value=f"{rating} / 5", inline=False)
+        return await interaction.response.send_message("⚠️ ユーザーIDは数字で入力してください。", ephemeral=True)
 
     try:
-        await channel.send(embed=embed)
+        channel_id = get_achievement_channel(interaction.guild.id)
+        if not channel_id:
+            return await interaction.response.send_message("⚠️ 実績投稿チャンネルが未設定です。", ephemeral=True)
+
+        tgt = interaction.guild.get_channel(channel_id)
+        if not tgt:
+            return await interaction.response.send_message("⚠️ チャンネルが見つかりません。", ephemeral=True)
+
+        embed = discord.Embed(title="🎉 新しい実績", color=discord.Color.gold())
+        embed.add_field(name="記入者ID", value=user_id, inline=False)
+        embed.add_field(name="内容", value=achievement, inline=False)
+        embed.add_field(name="コメント", value=comment, inline=False)
+        embed.add_field(name="評価", value=f"{rating}/5", inline=False)
+
+        await tgt.send(embed=embed)
         await interaction.response.send_message("✅ 実績を投稿しました！", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message("⚠️ 実績投稿チャンネルへの送信権限がありません。", ephemeral=True)
+    except Exception as e:
+        print(f"エラー: {e}")
+        await interaction.response.send_message("⚠️ エラーが発生しました。", ephemeral=True)
 
-# カテゴリー作成コマンド（管理者限定）
-@bot.tree.command(name="category_create", description="カテゴリーを作成します")
-@app_commands.describe(name="カテゴリー名", emoji="カテゴリーの絵文字（任意）")
-@app_commands.checks.has_permissions(administrator=True)
-async def category_create(interaction: discord.Interaction, name: str, emoji: str = None):
-    guild_id = interaction.guild.id
-    if guild_id not in categories:
-        categories[guild_id] = {}
+@bot.tree.command(name="create_category", description="チケットカテゴリーを作成します")
+async def create_category(interaction: discord.Interaction, name: str, emoji: str):
+    save_category(interaction.guild.id, name, emoji)
+    await interaction.response.send_message(f"✅ カテゴリー **{emoji} {name}** を作成しました！", ephemeral=True)
 
-    new_id = max(categories[guild_id].keys(), default=0) + 1
-    categories[guild_id][new_id] = {"name": name, "emoji": emoji}
-
-    await interaction.response.send_message(f"✅ カテゴリー「{name}」を作成しました。", ephemeral=True)
-
-# カテゴリー削除コマンド（管理者限定・選択型）
-@bot.tree.command(name="category_delete", description="カテゴリーを削除します")
-@app_commands.checks.has_permissions(administrator=True)
-async def category_delete(interaction: discord.Interaction):
-    guild_id = interaction.guild.id
-    if guild_id not in categories or not categories[guild_id]:
-        await interaction.response.send_message("⚠️ 削除できるカテゴリーがありません。", ephemeral=True)
+@bot.tree.command(name="delete_category", description="チケットカテゴリーを選択して削除します")
+async def delete_category(interaction: discord.Interaction):
+    categories_data = load_categories(interaction.guild.id)
+    if not categories_data:
+        await interaction.response.send_message("⚠️ カテゴリーが存在しません。", ephemeral=True)
         return
+    view = DeleteCategoryView(categories_data, interaction.guild.id)
+    await interaction.response.send_message(
+        embed=discord.Embed(title="🗑️ カテゴリー削除", description="削除するカテゴリーを選択してください。"),
+        view=view,
+        ephemeral=True
+    )
 
-    options = [
-        discord.SelectOption(
-            label=cat["name"],
-            emoji=cat["emoji"],
-            value=str(cat_id)
-        )
-        for cat_id, cat in categories[guild_id].items()
-    ]
-
-    class DeleteCategoryView(ui.View):
-        @ui.select(
-            placeholder="削除するカテゴリーを選択してください",
-            options=options
-        )
-        async def select_callback(self, interaction2: discord.Interaction, select: ui.Select):
-            cat_id = int(select.values[0])
-            cat_name = categories[guild_id][cat_id]["name"]
-            del categories[guild_id][cat_id]
-            await interaction2.response.edit_message(content=f"✅ カテゴリー「{cat_name}」を削除しました。", view=None)
-
-    view = DeleteCategoryView()
-    await interaction.response.send_message("🗑️ 削除するカテゴリーを選択してください。", view=view, ephemeral=True)
-
-# チケットパネル作成コマンド
-@bot.tree.command(name="maketike_panel", description="チケットパネルを作るゾ")
-@app_commands.describe(title="パネルのタイトル", description="パネルの説明")
-async def ticket_panel(interaction: discord.Interaction, title: str, description: str):
-    guild_id = interaction.guild.id
-    if guild_id not in categories or not categories[guild_id]:
-        await interaction.response.send_message("⚠️ カテゴリーが設定されていません。", ephemeral=True)
-        return
+@bot.tree.command(name="ticket_panel", description="チケットパネルを作成します")
+async def ticket_panel(interaction: discord.Interaction, title: str, description: str, image_url: str = None):
+    categories_data = load_categories(interaction.guild.id)
+    if not categories_data:
+        return await interaction.response.send_message("⚠️ カテゴリーが登録されていません。", ephemeral=True)
 
     embed = discord.Embed(title=title, description=description)
-    cats = [ {"name": v["name"], "emoji": v["emoji"]} for v in categories[guild_id].values() ]
-    await interaction.response.send_message(embed=embed, view=TicketView(cats))
+    if image_url:
+        embed.set_image(url=image_url)
+    await interaction.response.send_message(embed=embed, view=TicketView(categories_data))
 
-# 埋め込みメッセージ送信コマンド
-@bot.tree.command(name="send_embed", description="埋め込みめっせを送れるゾ")
-@app_commands.describe(
-    title="タイトル",
-    description="説明文",
-    emojis="表示したい絵文字をカンマ区切りで入力（任意）")
+@bot.tree.command(name="verify", description="認証用ロールパネルを配置")
+async def verify_panel(interaction: discord.Interaction, title: str, description: str, role: discord.Role, emoji: str = None):
+    full_title = f"{emoji} {title}" if emoji else title
+    await interaction.response.send_message(embed=discord.Embed(title=full_title, description=description), view=RoleButtonView(role))
+
+@bot.tree.command(name="discordacounts", description="チケットに他人を招待")
+async def ticket_permission(interaction: discord.Interaction, user: discord.Member):
+    await interaction.channel.set_permissions(user, view_channel=True, send_messages=True)
+    await interaction.response.send_message(f"✅ {user.mention} にチケット閲覧権限を付与しました！", ephemeral=True)
+
+@bot.tree.command(name="send_embed", description="埋め込みメッセージを送信")
 async def send_embed(interaction: discord.Interaction, title: str, description: str, emojis: str = None):
-    emoji_text = ""
-    if emojis:
-        emoji_list = [e.strip() for e in emojis.split(",") if e.strip()]
-        emoji_text = " ".join(emoji_list)
+    emoji_text = " ".join([e.strip() for e in (emojis or "").split(",") if e.strip()])
+    await interaction.response.send_message(embed=discord.Embed(title=f"{emoji_text} {title}".strip(), description=description))
 
-    embed = discord.Embed(title=f"{emoji_text} {title}".strip(), description=description)
+@bot.tree.command(name="nitropresent", description="ニトロプレゼント風ID表示")
+async def random_ids(interaction: discord.Interaction):
+    members = [m for m in interaction.guild.members if not m.bot]
+    if not members:
+        return await interaction.response.send_message("⚠️ メンバーがいません。", ephemeral=True)
+    random.shuffle(members)
+    out = "\n".join(f"`{m.id}`" for m in members[:25])
+    await interaction.response.send_message(f"🎲 ランダムなユーザーID:\n{out}", ephemeral=True)
+
+@bot.tree.command(name='achievement_panel', description='実績記入パネルを送信します')
+async def achievement_panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title='🎖️ 実績パネル',
+        description=(
+            '以下のテンプレートをコピーしてメッセージ編集で記入してください。\n\n'
+            '```\n'
+            '【記入者】<@ユーザーID>\n'
+            '【実績内容】ここに実績内容を入力\n'
+            '【コメント】ここにコメントを入力\n'
+            '【評価】1〜5\n'
+            '```\n'
+        ),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text='必要に応じてメッセージを編集してください。')
     await interaction.response.send_message(embed=embed)
 
-# ロール付与パネル作成コマンド
-@bot.tree.command(name="verify_panel", description="埋め込み型で認証パネル作るゾ")
-@app_commands.describe(
-    title="パネルのタイトル",
-    description="パネルの説明",
-    role="付与するロール",
-    emoji="パネルタイトルの前につける絵文字（Discord内絵文字OK）"
-)
-async def role_panel(interaction: discord.Interaction, title: str, description: str, role: discord.Role, emoji: str = None):
-    embed_title = f"{emoji} {title}".strip() if emoji else title
-    embed = discord.Embed(title=embed_title, description=description, color=discord.Color.blurple())
-    view = RoleButtonView(role)
-    await interaction.response.send_message(embed=embed, view=view)
-
-# ランダムで10個のユーザーIDを取得するコマンド（コピー可能なコードブロック表示）
-@bot.tree.command(name="random_gift", description="必ず入ってるギフトリンクを受け取れるゾ🎁")
-async def random_users(interaction: discord.Interaction):
-    members = [member for member in interaction.guild.members if not member.bot]
-    if not members:
-        await interaction.response.send_message("⚠️ メンバーが見つかりません。", ephemeral=True)
-        return
-
-    random.shuffle(members)
-    selected = members[:10]
-    user_ids = "\n".join([f"`{member.id}`" for member in selected])
-
-    await interaction.response.send_message(f"🎲 ランダムなユーザーID:\n{user_ids}", ephemeral=True)
-
-# --- Bot起動 ---
+# --- 起動処理 ---
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print("------")
+    print(f"✅ ログイン完了：{bot.user}（ID: {bot.user.id}）")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands.")
+        print(f"✅ {len(synced)} コマンドを同期しました。")
     except Exception as e:
-        print(f"Sync failed: {e}")
+        print("⚠️ コマンド同期失敗:", e)
 
-async def main():
-    # Webサーバーを開始
-    await start_web_server()
-    
-    # Botを開始
-    token = os.environ.get('DISCORD_TOKEN')
-    if not token:
-        print("Error: DISCORD_TOKEN environment variable not set")
-        return
-    
-    async with bot:
-        await bot.start(token)
+# --- Flaskサーバーの実行関数 ---
+def run_flask():
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False)
 
+# --- 実行部分（最後） ---
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Flaskサーバーを別スレッドで起動
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Discordボットを起動（環境変数からトークンを取得）
+    bot_token = os.environ.get('DISCORD_TOKEN')
+    if not bot_token:
+        print("⚠️ エラー: DISCORD_TOKEN環境変数が設定されていません")
+        exit(1)
+    
+    bot.run(bot_token)
